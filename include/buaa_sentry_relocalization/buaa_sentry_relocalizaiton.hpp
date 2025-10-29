@@ -4,6 +4,8 @@
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <pcl/point_cloud.h>
@@ -35,19 +37,18 @@ public:
 private:
   // ==== Callbacks ====
   void pcdCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
-  void initialPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
-  void processingPipeline();
 
   // ==== Helper ====
-  bool loadGlobalMap(const std::string & file_name);
-  void prepareSmallGICPTarget();
-  std::vector<Eigen::Vector3f> convertCloudToVec(const pcl::PointCloud<pcl::PointXYZ>& cloud);
-  Eigen::Isometry3d poseMsgToIso(const geometry_msgs::msg::PoseStamped & msg);
-  Eigen::Isometry3d isoFromPose(const kiss_matcher::Pose & p);
-  void publishPose(const Eigen::Isometry3d & pose);
+  void loadGlobalMap(const std::string & file_name);
+  std::vector<Eigen::Vector3f> BuaaSentryRelocalizationNode::convertCloudToVec(const pcl::PointCloud<pcl::PointXYZ>& cloud);
+  void publishTransform();
+  void coarseAlign();
+  void smallGicpAlign();
 
   // ==== ROS Interfaces ====
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   // ==== basic variable ====
@@ -58,19 +59,27 @@ private:
   std::string robot_base_frame_;
   std::string lidar_frame_;
   pcl::PointCloud<pcl::PointXYZ>::Ptr global_map_;
+  std::string current_scan_frame_id_;
+  rclcpp::Time last_scan_time_;
   pcl::PointCloud<pcl::PointXYZ>::Ptr registered_scan_;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_cloud_;
+  bool gicp_aligned_; // flag
+ 
+  // ==== timer ====
+  rclcpp::TimerBase::SharedPtr transform_timer_;
+  rclcpp::TimerBase::SharedPtr coarse_timer_;
+  rclcpp::TimerBase::SharedPtr gicp_timer_;
   
   // ==== kiss_matcher variable ====
   float resolution_;
   bool use_quatro_;
-  std::vector<Eigen::Vector3f> target_vec;
-  std::vector<Eigen::Vector3f> source_vec;
+  std::vector<Eigen::Vector3f> target_vec_;
+  std::vector<Eigen::Vector3f> source_vec_;
   std::vector<int> src_indices;
   std::vector<int> tgt_indices;
-  kiss_matcher::KISSMatcherConfig config_;
+  kiss_matcher::KISSMatcherConfig kiss_config_;
   std::unique_ptr<kiss_matcher::KISSMatcher> matcher_;
   kiss_matcher::RegistrationSolution solution_;
+  Eigen::Isometry3d coarse_result_;
 
   // ==== small_gicp variable ====
   int num_threads_;
@@ -85,16 +94,10 @@ private:
   std::shared_ptr<
     small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP>>
     register_;
+  Eigen::Isometry3d gicp_result_;
 
   // ==== Runtime ====
   std::mutex cloud_mutex_;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr latest_cloud_;
-  std::atomic<bool> have_new_cloud_;
-  std::atomic<bool> running_reg_;
-  Eigen::Isometry3d last_result_;
-
-  geometry_msgs::msg::PoseStamped external_initial_pose_;
-  bool has_external_initial_pose_ = false;
 };
 
 }  // namespace buaa_sentry_relocalization

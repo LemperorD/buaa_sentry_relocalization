@@ -12,20 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "buaa_sentry_relocalization/buaa_sentry_relocalization.hpp"
+#include "buaa_sentry_relocalization/buaa_sentry_relocalizaiton.hpp"
 
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.h>
 
+#include "pcl/common/transforms.h"
+#include "pcl_conversions/pcl_conversions.h"
+#include "small_gicp/pcl/pcl_registration.hpp"
+#include "small_gicp/util/downsampling_omp.hpp"
+#include "tf2_eigen/tf2_eigen.hpp"
+
 namespace buaa_sentry_relocalization
 {
 
 BuaaSentryRelocalizationNode::BuaaSentryRelocalizationNode(const rclcpp::NodeOptions & options)
 : Node("buaa_sentry_relocalization", options),
-  have_new_cloud_(false),
-  running_reg_(false)
+  coarse_result_(Eigen::Isometry3d::Identity()),
+  gicp_result_(Eigen::Isometry3d::Identity()),
+  gicp_aligned_(false)
 {
   // basic parameter
   this->declare_parameter("map_frame", "map");
@@ -58,168 +65,182 @@ BuaaSentryRelocalizationNode::BuaaSentryRelocalizationNode(const rclcpp::NodeOpt
   this->get_parameter("registered_leaf_size", registered_leaf_size_);
   this->get_parameter("max_dist_sq", max_dist_sq_);
 
+  registered_scan_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  global_map_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "registered_scan", 5, std::bind(&BuaaSentryRelocalizationNode::pcdCallback, this, std::placeholders::_1));
+
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
-  // Load map
-  if (!prior_pcd_file_.empty() && loadGlobalMap(prior_pcd_file_)) {
-    RCLCPP_INFO(this->get_logger(), "Loaded global map: %zu points", global_map_->size());
-  }
+  loadGlobalMap(prior_pcd_file_);
+  pcl::removeNaNFromPointCloud(*global_map_, *global_map_, tgt_indices);
 
   // Init KISS
   kiss_config_ = kiss_matcher::KISSMatcherConfig(resolution_);
-  kiss_config_.use_quatro = use_quatro_;
+  kiss_config_.use_quatro_ = use_quatro_;
   matcher_ = std::make_unique<kiss_matcher::KISSMatcher>(kiss_config_);
-  if (global_map_) {
-    target_vec_ = convertCloudToVec(*global_map_);
-    matcher_->setTarget(target_vec_);
-  }
+  target_vec_ = convertCloudToVec(*global_map_);
 
   // Init small_gicp
-  prepareSmallGICPTarget();
+  target_ = small_gicp::voxelgrid_sampling_omp<
+    pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
+    *global_map_, global_leaf_size_);
+  small_gicp::estimate_covariances_omp(*target_, num_neighbors_, num_threads_);
+  target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
+    target_, small_gicp::KdTreeBuilderOMP(num_threads_));
+  register_ = std::make_shared<
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP>>();
+
+  coarse_timer_ = this->create_wall_timer(
+  std::chrono::milliseconds(100),  // 粗配准：10Hz
+  std::bind(&BuaaSentryRelocalizationNode::coarseAlign, this));
+
+  gicp_timer_ = this->create_wall_timer(
+  std::chrono::milliseconds(500),  // 精配准：2Hz
+  std::bind(&BuaaSentryRelocalizationNode::smallGicpAlign, this));
+
+  transform_timer_ = this->create_wall_timer(
+  std::chrono::milliseconds(50),  // 20Hz
+  std::bind(&BuaaSentryRelocalizationNode::publishTransform, this));
+}
+
+void BuaaSentryRelocalizationNode::loadGlobalMap(const std::string & file_name)
+{
+  if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_name, *global_map_) == -1) {
+    RCLCPP_ERROR(this->get_logger(), "Couldn't read PCD file: %s", file_name.c_str());
+  }
+  RCLCPP_INFO(this->get_logger(), "Loaded global map with %zu points", global_map_->points.size());
+
+  Eigen::Affine3d odom_to_lidar_odom;
+  while (true) {
+    try {
+      auto tf_stamped = tf_buffer_->lookupTransform(
+        base_frame_, lidar_frame_, this->now(), rclcpp::Duration::from_seconds(1.0));
+      odom_to_lidar_odom = tf2::transformToEigen(tf_stamped.transform);
+      RCLCPP_INFO_STREAM(
+        this->get_logger(), "odom_to_lidar_odom: translation = "
+                              << odom_to_lidar_odom.translation().transpose() << ", rpy = "
+                              << odom_to_lidar_odom.rotation().eulerAngles(0, 1, 2).transpose());
+      break;
+    } catch (tf2::TransformException & ex) {
+      RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s Retrying...", ex.what());
+      rclcpp::sleep_for(std::chrono::seconds(1));
+    }
+  }
+  pcl::transformPointCloud(*global_map_, *global_map_, odom_to_lidar_odom);
 }
 
 void BuaaSentryRelocalizationNode::pcdCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
-  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
-  pcl::fromROSMsg(*msg, *cloud);
+  std::lock_guard<std::mutex> lock(cloud_mutex_);
+  last_scan_time_ = msg->header.stamp;
+  current_scan_frame_id_ = msg->header.frame_id;
 
-  {
-    std::lock_guard<std::mutex> lock(cloud_mutex_);
-    latest_cloud_ = cloud;
-    have_new_cloud_.store(true);
+  pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>());
+  pcl::fromROSMsg(*msg, *scan);
+  *registered_scan_ += *scan;
+}
+
+std::vector<Eigen::Vector3f> BuaaSentryRelocalizationNode::convertCloudToVec(const pcl::PointCloud<pcl::PointXYZ>& cloud) {
+  std::vector<Eigen::Vector3f> vec;
+  vec.reserve(cloud.size());
+  for (const auto& pt : cloud.points) {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    vec.emplace_back(pt.x, pt.y, pt.z);
+  }
+  return vec;
+}
+
+void BuaaSentryRelocalizationNode::publishTransform()
+{
+  if (!gicp_aligned_) return;
+  
+  if (gicp_result_.matrix().isZero()) {
+    return;
   }
 
-  bool expected = false;
-  if (running_reg_.compare_exchange_strong(expected, true)) {
-    std::thread(&BuaaSentryRelocalization::processingPipeline, this).detach();
+  geometry_msgs::msg::TransformStamped transform_stamped;
+  // `+ 0.1` means transform into future. according to https://robotics.stackexchange.com/a/96615
+  transform_stamped.header.stamp = last_scan_time_ + rclcpp::Duration::from_seconds(0.1);
+  transform_stamped.header.frame_id = map_frame_;
+  transform_stamped.child_frame_id = odom_frame_;
+
+  const Eigen::Vector3d translation = gicp_result_.translation();
+  const Eigen::Quaterniond rotation(gicp_result_.rotation());
+
+  transform_stamped.transform.translation.x = translation.x();
+  transform_stamped.transform.translation.y = translation.y();
+  transform_stamped.transform.translation.z = translation.z();
+  transform_stamped.transform.rotation.x = rotation.x();
+  transform_stamped.transform.rotation.y = rotation.y();
+  transform_stamped.transform.rotation.z = rotation.z();
+  transform_stamped.transform.rotation.w = rotation.w();
+
+  tf_broadcaster_->sendTransform(transform_stamped);
+}
+
+void BuaaSentryRelocalizationNode::coarseAlign()
+{
+  std::lock_guard<std::mutex> lock(cloud_mutex_);
+  if (registered_scan_->empty()) {
+    RCLCPP_WARN(this->get_logger(), "No accumulated points to process.");
+    return;
+  }
+
+  pcl::removeNaNFromPointCloud(*registered_scan_, *registered_scan_, src_indices);
+  source_vec_ = convertCloudToVec(*registered_scan_);
+                      
+  solution_ = matcher_->estimate(source_vec_, target_vec_);
+
+  if (solution_.valid && matcher_->getNumFinalInliers() > 5 && !gicp_aligned_) {
+    coarse_result_.translation() = solution_.translation;
+    coarse_result_.linear() = solution_.rotation;
   }
 }
 
-void BuaaSentryRelocalization::processingPipeline()
+
+void BuaaSentryRelocalizationNode::smallGicpAlign()
 {
-  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
-  {
-    std::lock_guard<std::mutex> lock(cloud_mutex_);
-    if (!latest_cloud_) {
-      running_reg_.store(false);
-      return;
-    }
-    cloud = latest_cloud_;
-    have_new_cloud_.store(false);
+  std::lock_guard<std::mutex> lock(cloud_mutex_);
+  if (registered_scan_->empty()) {
+    RCLCPP_WARN(this->get_logger(), "No accumulated points to process.");
+    return;
   }
 
-  Eigen::Isometry3d initial_guess = Eigen::Isometry3d::Identity();
-  bool have_coarse = false;
+  source_ = small_gicp::voxelgrid_sampling_omp<
+    pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
+    *registered_scan_, registered_leaf_size_);
 
-  source_vec = convertCloudToVec(*cloud);
-  auto result = matcher_->match(source_vec);
-  if (result.success) {
-    initial_guess = isoFromPose(result.pose);
-    have_coarse = true;
+  small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads_);
+
+  source_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
+    source_, small_gicp::KdTreeBuilderOMP(num_threads_));
+
+  if (!source_ || !source_tree_) {
+    return;
   }
 
-  if (!have_coarse && has_external_initial_pose_) {
-    initial_guess = poseMsgToIso(external_initial_pose_);
-    have_coarse = true;
+  register_->reduction.num_threads = num_threads_;
+  register_->rejector.max_dist_sq = max_dist_sq_;
+  register_->optimizer.max_iterations = 10;
+
+  auto result = register_->align(*target_, *source_, *target_tree_, coarse_result_);
+
+  if (result.converged) {
+    gicp_result_ = coarse_result_ = result.T_target_source;
+    gicp_aligned_ = true;
+  } else {
+    RCLCPP_WARN(this->get_logger(), "GICP did not converge.");
+    gicp_aligned_ = false;
   }
 
-  // small_gicp refinement
-  Eigen::Isometry3d final_pose = initial_guess;
-  if (use_small_gicp_ && target_ && target_tree_) {
-    pcl::PointCloud<pcl::PointCovariance>::Ptr src_cov(
-        new pcl::PointCloud<pcl::PointCovariance>());
-    *src_cov = small_gicp::voxelgrid_sampling<pcl::PointCloud<pcl::PointXYZ>,
-                                             pcl::PointCloud<pcl::PointCovariance>>(*cloud, global_leaf_size_);
-    small_gicp::estimate_covariances_omp(*src_cov, num_neighbors_, num_threads_);
-    auto src_tree =
-        std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(src_cov);
-    small_gicp::SmallGICP gicp;
-    gicp.setInputTarget(target_, target_tree_);
-    gicp.setInputSource(src_cov, src_tree);
-    small_gicp::SmallGICP::Params params;
-    params.num_threads = num_threads_;
-    params.max_correspondence_distance = max_corr_dist_;
-    gicp.setParameters(params);
-    auto res = gicp.optimize(initial_guess);
-    if (res.converged) {
-      final_pose = res.transformation;
-    }
-  }
-
-  publishPose(final_pose);
-  running_reg_.store(false);
-}
-
-bool BuaaSentryRelocalization::loadGlobalMap(const std::string & file_name)
-{
-  global_map_.reset(new pcl::PointCloud<pcl::PointXYZ>());
-  if (pcl::io::loadPCDFile(file_name, *global_map_) < 0) return false;
-  std::vector<int> idx;
-  pcl::removeNaNFromPointCloud(*global_map_, *global_map_, idx);
-  return true;
-}
-
-void BuaaSentryRelocalization::prepareSmallGICPTarget()
-{
-  target_ = small_gicp::voxelgrid_sampling<pcl::PointCloud<pcl::PointXYZ>,
-                                           pcl::PointCloud<pcl::PointCovariance>>(
-      *global_map_, global_leaf_size_);
-  small_gicp::estimate_covariances_omp(*target_, num_neighbors_, num_threads_);
-  target_tree_ =
-      std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
-          target_, small_gicp::KdTreeBuilderOMP(num_threads_));
-}
-
-std::vector<Eigen::Vector3f>
-BuaaSentryRelocalization::convertCloudToVec(const pcl::PointCloud<pcl::PointXYZ>& cloud)
-{
-  std::vector<Eigen::Vector3f> out;
-  out.reserve(cloud.size());
-  for (auto & p : cloud) {
-    if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
-      out.emplace_back(p.x, p.y, p.z);
-  }
-  return out;
-}
-
-Eigen::Isometry3d BuaaSentryRelocalization::poseMsgToIso(const geometry_msgs::msg::PoseStamped & msg)
-{
-  Eigen::Quaterniond q(msg.pose.orientation.w, msg.pose.orientation.x,
-                       msg.pose.orientation.y, msg.pose.orientation.z);
-  Eigen::Isometry3d iso = Eigen::Isometry3d::Identity();
-  iso.linear() = q.toRotationMatrix();
-  iso.translation() =
-      Eigen::Vector3d(msg.pose.position.x, msg.pose.position.y, msg.pose.position.z);
-  return iso;
-}
-
-Eigen::Isometry3d BuaaSentryRelocalization::isoFromPose(const kiss_matcher::Pose & p)
-{
-  Eigen::Isometry3d iso = Eigen::Isometry3d::Identity();
-  iso.translation() = Eigen::Vector3d(p.x, p.y, p.z);
-  Eigen::Quaterniond q(p.qw, p.qx, p.qy, p.qz);
-  iso.linear() = q.toRotationMatrix();
-  return iso;
-}
-
-void BuaaSentryRelocalization::publishPose(const Eigen::Isometry3d & pose)
-{
-  geometry_msgs::msg::PoseStamped ps;
-  ps.header.stamp = now();
-  ps.header.frame_id = frame_id_;
-  ps.pose = tf2::toMsg(tf2::eigenToTransform(pose));
-  pose_pub_->publish(ps);
-
-  geometry_msgs::msg::TransformStamped tf_msg;
-  tf_msg.header = ps.header;
-  tf_msg.child_frame_id = child_frame_id_;
-  tf_msg.transform = tf2::toMsg(tf2::eigenToTransform(pose));
-  tf_broadcaster_->sendTransform(tf_msg);
+  registered_scan_->clear();
 }
 
 }  // namespace buaa_sentry_relocalization
 
 #include <rclcpp_components/register_node_macro.hpp>
-RCLCPP_COMPONENTS_REGISTER_NODE(buaa_sentry_relocalization::BuaaSentryRelocalization)
+RCLCPP_COMPONENTS_REGISTER_NODE(buaa_sentry_relocalization::BuaaSentryRelocalizationNode)
