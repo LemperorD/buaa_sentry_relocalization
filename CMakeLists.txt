@@ -6,18 +6,17 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # find dependencies
-find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
-ament_auto_find_build_dependencies()
-
 find_package(OpenMP REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(teaserpp REQUIRED)
 find_package(PCL REQUIRED)
 find_package(robin REQUIRED)
 find_package(kiss_matcher REQUIRED)
+ament_auto_find_build_dependencies()
 
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})

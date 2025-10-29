@@ -40,7 +40,7 @@ private:
 
   // ==== Helper ====
   void loadGlobalMap(const std::string & file_name);
-  std::vector<Eigen::Vector3f> BuaaSentryRelocalizationNode::convertCloudToVec(const pcl::PointCloud<pcl::PointXYZ>& cloud);
+  std::vector<Eigen::Vector3f> convertCloudToVec(const pcl::PointCloud<pcl::PointXYZ>& cloud);
   void publishTransform();
   void coarseAlign();
   void smallGicpAlign();

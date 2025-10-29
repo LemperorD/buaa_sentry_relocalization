@@ -17,7 +17,6 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <tf2_eigen/tf2_eigen.h>
 
 #include "pcl/common/transforms.h"
 #include "pcl_conversions/pcl_conversions.h"
@@ -30,9 +29,9 @@ namespace buaa_sentry_relocalization
 
 BuaaSentryRelocalizationNode::BuaaSentryRelocalizationNode(const rclcpp::NodeOptions & options)
 : Node("buaa_sentry_relocalization", options),
+  gicp_aligned_(false),
   coarse_result_(Eigen::Isometry3d::Identity()),
-  gicp_result_(Eigen::Isometry3d::Identity()),
-  gicp_aligned_(false)
+  gicp_result_(Eigen::Isometry3d::Identity())
 {
   // basic parameter
   this->declare_parameter("map_frame", "map");
