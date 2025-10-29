@@ -1,7 +1,7 @@
 # buaa_sentry_relocalization
 
 <div style="text-align: center;">
-  <img src="../../../images/transistor_code.png" width="400" height="400">
+  <img src="images/transistor_code.png" width="400" height="400">
 </div>
 
 借鉴了北极熊导航对重定位的目标与相应的技术路线拟定，结合[Kiss_MATCHER](https://github.com/MIT-SPARK/KISS-Matcher)作为粗配准给出一个粗糙的定位信息，以及[Small_gicp](https://github.com/koide3/small_gicp)作为精配准在粗配准的的基础上迭代求解，在仿真中大概实现了无先验位姿的重定位算法。
