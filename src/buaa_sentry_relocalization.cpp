@@ -136,6 +136,7 @@ void BuaaSentryRelocalizationNode::loadGlobalMap(const std::string & file_name)
 void BuaaSentryRelocalizationNode::pcdCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(cloud_mutex_);
+
   last_scan_time_ = msg->header.stamp;
   current_scan_frame_id_ = msg->header.frame_id;
 
@@ -185,6 +186,7 @@ void BuaaSentryRelocalizationNode::publishTransform()
 void BuaaSentryRelocalizationNode::coarseAlign()
 {
   std::lock_guard<std::mutex> lock(cloud_mutex_);
+
   if (registered_scan_->empty()) {
     RCLCPP_WARN(this->get_logger(), "No accumulated points to process.");
     return;
@@ -199,12 +201,15 @@ void BuaaSentryRelocalizationNode::coarseAlign()
     coarse_result_.translation() = solution_.translation;
     coarse_result_.linear() = solution_.rotation;
   }
+  
+  return;
 }
 
 
 void BuaaSentryRelocalizationNode::smallGicpAlign()
 {
   std::lock_guard<std::mutex> lock(cloud_mutex_);
+
   if (registered_scan_->empty()) {
     RCLCPP_WARN(this->get_logger(), "No accumulated points to process.");
     return;
@@ -238,6 +243,7 @@ void BuaaSentryRelocalizationNode::smallGicpAlign()
   }
 
   registered_scan_->clear();
+  return;
 }
 
 }  // namespace buaa_sentry_relocalization
