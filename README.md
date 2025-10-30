@@ -36,7 +36,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release && make -j
 sudo make install
 ```
 
-### 3. Kiss_MATCHER
+### 3. KISS_Matcher
 
 ```bash
 mkdir -p ~/tools && cd ~/tools
@@ -54,3 +54,10 @@ make deps & make cppinstall
 ## 2. 调参教程
 
 TBD
+
+## 3. 开发过程中的问题
+
+> 由于26新赛季规则不允许提前在现场建图，这导致我们的重定位很可能无法使用，但介于在新规则出现之前我们就开始筹备相关的开发工作，所以此处只列出一部分测试问题，而且本赛季将不会去解决
+
+- [ ] 地图对称导致粗配准的时候180度颠倒
+  - 拟定解决方案：加入先验旋转矩阵

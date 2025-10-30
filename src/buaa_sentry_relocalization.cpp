@@ -184,8 +184,6 @@ void BuaaSentryRelocalizationNode::publishTransform()
 
 void BuaaSentryRelocalizationNode::coarseAlign()
 {
-  std::lock_guard<std::mutex> lock(cloud_mutex_);
-
   if (registered_scan_->empty()) {
     RCLCPP_WARN(this->get_logger(), "No accumulated points to process.");
     return;
@@ -203,7 +201,6 @@ void BuaaSentryRelocalizationNode::coarseAlign()
   
   return;
 }
-
 
 void BuaaSentryRelocalizationNode::smallGicpAlign()
 {
@@ -239,6 +236,7 @@ void BuaaSentryRelocalizationNode::smallGicpAlign()
   } else {
     RCLCPP_WARN(this->get_logger(), "GICP did not converge.");
     gicp_aligned_ = false;
+    return;
   }
 
   registered_scan_->clear();
